@@ -1,0 +1,331 @@
+#!/usr/bin/env Rscript
+# FAITHFUL-REPRODUCTION HARNESS (not the shippable template).
+#
+# Reproduces the published Kaufman 2020 per-method GMST by running the authors'
+# own compositeR engine on the canonical LiPD files WITH real chronology
+# ensembles (ScientificDataAnalysis/lipdFilesWithEnsembles), applying the exact
+# published record filter (paleoData_inCompilation == "temp12kEnsemble" &
+# seasonalityGeneral in {annual,summerOnly,winterOnly} & degC), with
+# ageVar="ageEnsemble" (NOT BAM). Compare output to reference_data/published.
+#
+# This is reproduction-only. The temp12kEnsemble filter / ensemble-file source
+# must NOT leak into the user-facing template (see feedback_reproduction_vs_template).
+#
+# Usage (in the presto-temp12k container, cwd = / so renv activates):
+#   Rscript /repro/repro.R --method dcc --nens 50 --out /repro/out
+suppressWarnings(suppressPackageStartupMessages({
+  library(lipdR); library(geoChronR); library(compositeR); library(purrr)
+}))
+
+`%||%` <- function(a, b) if (is.null(a) || length(a) == 0 || all(is.na(a))) b else a
+
+args <- commandArgs(trailingOnly = TRUE)
+getarg <- function(flag, default = NULL) { i <- which(args == flag); if (length(i)) args[i + 1] else default }
+METHOD <- getarg("--method", "dcc")
+NENS   <- as.integer(getarg("--nens", "50"))
+OUT    <- getarg("--out", "/repro/out")
+LPDDIR <- getarg("--lpd", "/repro/T12k/ScientificDataAnalysis/lipdFilesWithEnsembles")
+NCORES <- as.integer(getarg("--ncores", "4"))
+dir.create(OUT, recursive = TRUE, showWarnings = FALSE)
+
+LATBINS <- seq(-90, 90, by = 30)
+ZONAL_W <- sin(LATBINS[-1] * pi / 180) - sin(LATBINS[-length(LATBINS)] * pi / 180)
+ZONAL_W <- ZONAL_W / sum(ZONAL_W)                 # area weights, sum=1
+N_BANDS <- length(ZONAL_W)
+binvec  <- seq(-50, 12050, by = 100)
+binAges <- rowMeans(cbind(binvec[-1], binvec[-length(binvec)]))   # 0..12000
+
+# ---- build (and cache) the filtered, cleaned record set -------------------------
+# Slim per-method cache so iterating doesn't reload the ~900MB full-TS rds.
+slim <- file.path(OUT, paste0("fts_", METHOD, ".rds"))
+if (file.exists(slim)) {
+  cat("[repro] loading slim record cache:", slim, "\n")
+  s <- readRDS(slim); fTS <- s$fTS; lat <- s$lat; lon <- s$lon
+  cat("[repro] records:", length(fTS), "\n")
+} else {
+  ts_cache <- file.path(OUT, "ts_all.rds")
+  if (file.exists(ts_cache)) {
+    cat("[repro] loading cached TS:", ts_cache, "\n"); TS <- readRDS(ts_cache)
+  } else {
+    cat("[repro] reading LiPD files from", LPDDIR, "...\n")
+    D <- readLipd(LPDDIR); TS <- extractTs(D); saveRDS(TS, ts_cache)
+    cat("[repro] cached", length(TS), "TS columns ->", ts_cache, "\n")
+  }
+  cat("[repro] total TS columns:", length(TS), "\n")
+
+  season_raw <- vapply(TS, function(t) as.character(t[["interpretation1_seasonalityGeneral"]] %||% NA)[1], character(1))
+  units  <- tolower(vapply(TS, function(t) as.character(t[["paleoData_units"]] %||% NA)[1], character(1)))
+  # SCC.m / DCC.R semantics: strncmpi("annual",.,7) | strncmp("summerOnly",.,7) | strncmp("winterOnly",.,7).
+  # strncmp with n=7 over 'annual' (len 6) requires exact equality (case-insensitive).
+  # strncmp with n=7 over 'summerOnly'/'winterOnly' (len 10) requires the first 7 chars to match.
+  match_season <- function(s) {
+    if (is.na(s)) return(FALSE)
+    tolower(s) == "annual" || startsWith(s, "summerO") || startsWith(s, "winterO")
+  }
+  season_ok <- vapply(season_raw, match_season, logical(1))
+  # Per-method inCompilation tag (the published drivers differ!):
+  #   SCC, GAM use "Temp12k" (case-sensitive exact match, broader set ~1318 records)
+  #   DCC, CPS, PaiCo use "temp12kEnsemble" (the ensemble subset, ~1327 records)
+  if (METHOD %in% c("scc", "gam")) {
+    in_tag <- vapply(TS, function(t) any(as.character(unlist(t[["paleoData_inCompilation"]])) == "Temp12k"), logical(1))
+    tag_label <- "Temp12k"
+  } else {                                          # dcc, cps, paico
+    in_tag <- vapply(TS, function(t) any(tolower(as.character(unlist(t[["paleoData_inCompilation"]]))) == "temp12kensemble"), logical(1))
+    tag_label <- "temp12kEnsemble"
+  }
+
+  degc_methods <- c("dcc", "scc", "cps")           # composite methods need degC
+  keep <- in_tag & season_ok &
+          (units == "degc" | !(METHOD %in% degc_methods))
+  cat(sprintf("[repro] filter: %s=%d, +season=%d, +degC=%d -> KEEP %d records\n",
+              tag_label, sum(in_tag),
+              sum(in_tag & season_ok),
+              sum(keep & units == "degc"), sum(keep)))
+  fTS <- TS[which(keep)]
+
+  # ---- chronModel ensemble repair ----------------------------------------------
+  # The newer lipdR's extractTs attaches the measurement-table ageEnsemble to
+  # records whose values actually live in a paleoModel/ensembleTable -- e.g.
+  # MD97-2120 has three SST ensemble columns at 1779 rows in
+  # paleo1model1ensemble1.csv, but extractTs gives them the 720-row
+  # measurement-table ageEnsemble (a mis-pairing). The CORRECT ageEnsemble for
+  # these records is in chron1model1ensemble1.csv (1779 rows x 1000 members).
+  # Without this fix the records get dropped by the NROW filter below and the
+  # deglacial 12 ka is +0.07 cold-biased because those records are marine SST
+  # proxies showing deglacial WARMING.
+  lpd_dir <- LPDDIR
+  chron_cache <- new.env(parent = emptyenv())
+  load_chron_ensemble <- function(dsname) {
+    if (exists(dsname, envir = chron_cache, inherits = FALSE)) return(get(dsname, envir = chron_cache))
+    lpd_path <- file.path(lpd_dir, paste0(dsname, ".lpd"))
+    if (!file.exists(lpd_path)) { assign(dsname, NULL, envir = chron_cache); return(NULL) }
+    tmp <- tempfile(); dir.create(tmp); on.exit(unlink(tmp, recursive = TRUE), add = TRUE)
+    csvs <- tryCatch(suppressWarnings({
+      unzip(lpd_path, exdir = tmp)
+      list.files(tmp, pattern = "chron[0-9]+model[0-9]+ensemble[0-9]+\\.csv$",
+                 recursive = TRUE, full.names = TRUE)
+    }), error = function(e) character(0))
+    if (length(csvs) == 0) { assign(dsname, NULL, envir = chron_cache); return(NULL) }
+    # The chronModel ensemble CSVs in lipdFilesWithEnsembles have NO header
+    # row (first line is data); first column = depth, rest = age realizations.
+    d <- tryCatch(read.csv(csvs[1], header = FALSE, check.names = FALSE),
+                  error = function(e) NULL)
+    if (is.null(d) || ncol(d) < 2) { assign(dsname, NULL, envir = chron_cache); return(NULL) }
+    # First column is depth (or another non-member field); the remaining columns
+    # are the age ensemble realizations. Coerce to numeric matrix.
+    ens <- suppressWarnings(as.matrix(d[, -1, drop = FALSE]))
+    mode(ens) <- "numeric"
+    assign(dsname, ens, envir = chron_cache); ens
+  }
+  n_repaired <- 0
+  apply_chron_repair <- nzchar(Sys.getenv("PRESTO_CHRON_REPAIR", "1")) &&
+                        Sys.getenv("PRESTO_CHRON_REPAIR", "1") != "0"
+  for (k in if (apply_chron_repair) seq_along(fTS) else integer(0)) {
+    v <- fTS[[k]]$paleoData_values; ae <- fTS[[k]]$ageEnsemble
+    if (is.null(ae) || NROW(as.matrix(v)) == NROW(as.matrix(ae))) next
+    dsname <- as.character(fTS[[k]]$dataSetName)
+    if (!nzchar(dsname)) next
+    new_ae <- load_chron_ensemble(dsname)
+    if (!is.null(new_ae) && NROW(new_ae) == NROW(as.matrix(v))) {
+      fTS[[k]]$ageEnsemble <- new_ae
+      n_repaired <- n_repaired + 1
+    }
+  }
+  cat(sprintf("[repro] chronModel ensemble repair: re-paired ageEnsemble for %d records\n", n_repaired))
+
+  # Newer lipdR/geoChronR returns paleoData_values as a value-ensemble matrix and,
+  # for a few records, maps the ageEnsemble onto a different-length axis than the
+  # values (e.g. val 81 obs vs ageEnsemble 41). compositeEnsembles draws one column
+  # from each and requires NROW(values)==NROW(ageEnsemble); one mismatched record
+  # aborts the whole band. Drop those that remain inconsistent after the repair.
+  good <- vapply(fTS, function(t) {
+    v <- t$paleoData_values; ae <- t[["ageEnsemble"]]
+    !is.null(ae) && NROW(as.matrix(v)) == NROW(as.matrix(ae)) && NROW(as.matrix(ae)) >= 4
+  }, logical(1))
+  cat(sprintf("[repro] dropping %d records NROW(values)!=NROW(ageEnsemble); %d remain\n", sum(!good), sum(good)))
+  fTS <- fTS[good]
+
+  # Strip each record to the four fields compositeEnsembles/sampleEnsembleThenBinTs
+  # actually touches (dataSetName, paleoData_values, ageEnsemble, paleoData_uncertainty1sd)
+  # and pre-flip negative-direction proxies (compositeR's str_detect for "_interpDirection"
+  # doesn't match this data's "interpretation1_direction" field, so its alignInterpDirection
+  # branch is a silent no-op — must be done explicitly). This shrinks the slim cache ~10x
+  # and lets fork workers share memory cleanly.
+  lat <- vapply(fTS, function(t) suppressWarnings(as.numeric(t$geo_latitude %||% NA)), numeric(1))
+  lon <- vapply(fTS, function(t) suppressWarnings(as.numeric(t$geo_longitude %||% NA)), numeric(1))
+  dirs <- vapply(fTS, function(t) tolower(as.character(t$interpretation1_direction %||% "positive"))[1], character(1))
+  fTS <- lapply(seq_along(fTS), function(i) {
+    t <- fTS[[i]]
+    v <- t$paleoData_values; if (!is.matrix(v)) v <- matrix(as.numeric(v), ncol = 1)
+    if (identical(dirs[i], "negative")) v <- v * -1
+    u <- suppressWarnings(as.numeric(t$paleoData_temperature12kUncertainty %||% NA))
+    # also carry proxy + seasonality for GAM's per-proxy/per-season sigma lookup
+    proxy <- as.character(t$paleoData_proxy %||% t$paleoData_proxyGeneral %||% "")
+    season <- as.character(t$interpretation1_seasonalityGeneral %||% "")
+    list(dataSetName = as.character(t$dataSetName),
+         paleoData_values = v,
+         ageEnsemble = as.matrix(t$ageEnsemble),
+         paleoData_uncertainty1sd = if (is.finite(u)) u else NULL,
+         paleoData_proxy = proxy,
+         seasonalityGeneral = season)
+  })
+  saveRDS(list(fTS = fTS, lat = lat, lon = lon), slim)
+  cat("[repro] wrote slim cache ->", slim, "  (size:", file.info(slim)$size %/% 1e6, "MB)\n")
+}
+
+# ---- SCC equal-area gridding setup (per-cell cell-id, computed once) ------------
+cell <- NULL
+if (METHOD == "scc") {
+  grid_csv <- getarg("--grid", "/repro/equal_area_grid_centers.csv")
+  g <- read.csv(grid_csv)
+  rad <- pi / 180
+  cell <- vapply(seq_along(lat), function(i) {
+    if (!is.finite(lat[i]) || !is.finite(lon[i])) return(NA_integer_)
+    d <- sin(g$clat * rad) * sin(lat[i] * rad) +
+         cos(g$clat * rad) * cos(lat[i] * rad) * cos((g$clon180 - lon[i]) * rad)
+    which.max(pmin(pmax(d, -1), 1))
+  }, integer(1))
+  cat(sprintf("[repro] SCC: %d/%d records assigned to %d unique equal-area cells\n",
+              sum(!is.na(cell)), length(cell), length(unique(na.omit(cell)))))
+}
+
+# ---- method standardization settings (faithful to the published drivers) --------
+stan_args <- switch(METHOD,
+  dcc = list(duration = 3000, searchRange = c(0, 7000), normalizeVariance = FALSE),
+  cps = list(duration = 3000, searchRange = c(0, 7000), normalizeVariance = TRUE),
+  scc = NULL,                                                       # SCC has its own path
+  stop("method not yet wired in harness: ", METHOD))
+
+# DCC/CPS one_member: compositeEnsembles via the authors' engine.
+# MEMBER-LEVEL RETRY: standardizeMeanIteratively throws "No good columns after
+# standardization" when its random 3000-yr-window in [0,7000] drops too many
+# records (esp. the southern band, ~12 records). Band-level retry isn't enough --
+# some draws are dead-ends. So if ANY band fails after band-level retries,
+# re-draw the whole member. This matches what the published authors plausibly
+# did (DCC.R uses foreach without tryCatch; failed iterations had to be
+# regenerated). Without this, ~25% of members are fully-NaN and the survivors
+# are selection-biased -> +0.03 mid-Hol warm + -0.06 12 ka cold.
+one_member_compose <- function(m) {
+  required_bands <- seq_len(N_BANDS)[vapply(seq_len(N_BANDS),
+    function(b) sum(lat > LATBINS[b] & lat < LATBINS[b + 1]) >= 2, logical(1))]
+  for (member_try in seq_len(10)) {
+    bandMat <- matrix(NA_real_, nrow = length(binAges), ncol = N_BANDS)
+    success <- TRUE
+    for (b in required_bands) {
+      fi <- which(lat > LATBINS[b] & lat < LATBINS[b + 1])
+      tc <- NULL
+      for (band_retry in seq_len(15)) {
+        tc <- tryCatch(
+          do.call(compositeEnsembles, c(list(fTS = fTS[fi], binvec = binvec, spread = TRUE,
+                  gaussianizeInput = FALSE, ageVar = "ageEnsemble", alignInterpDirection = FALSE), stan_args)),
+          error = function(e) NULL)
+        if (!is.null(tc) && !is.null(tc$composite) && any(is.finite(tc$composite))) break
+      }
+      if (is.null(tc) || is.null(tc$composite) || !any(is.finite(tc$composite))) {
+        success <- FALSE; break
+      }
+      bandMat[, b] <- tc$composite
+    }
+    if (success) return(bandMat)
+  }
+  bandMat                                     # fallback: return what we got
+}
+
+# SCC one_member -- FAITHFUL TO THE PUBLISHED UNCERTAINTY MODEL.
+# Matches SCC_GMST_122719.m line ~ "[bin_mean,...]=bin_x(TS(c(j)).age*normrnd(1,0.05),
+#   TS(c(j)).paleoData_values + normrnd(0,er,...), binVec)":
+#   * representative age = first ageEnsemble column (the single chronology series)
+#   * representative value = row-wise median across the value-ensemble matrix
+#   * per-record per-iteration: age *= N(1, 0.05) [SINGLE multiplicative scalar],
+#     value += N(0, unc) per sample where unc = paleoData_temperature12kUncertainty
+#     (default 1.5 degC, exactly the SCC.m fallback)
+#   * direct binning (no spread) -- matches MATLAB's bin_x
+# Pipeline: bin -> equal-area grid -> per-cell anomaly vs 3-5 ka -> mean cells per band.
+one_member_scc <- function(m) {
+  nb_edges <- length(binvec)
+  is_first <- (m == 1)              # SCC_GMST_122719.m line 118: ii==1 is unperturbed baseline
+  bandMat <- matrix(NA_real_, nrow = length(binAges), ncol = N_BANDS)
+  for (b in seq_len(N_BANDS)) {
+    fi <- which(lat > LATBINS[b] & lat < LATBINS[b + 1])     # SCC.m/DCC.R: strict on both edges
+    if (length(fi) < 2) next
+    bm <- vapply(fTS[fi], function(t) {
+      ae <- t$ageEnsemble
+      age_rep <- if (!is.null(ae) && is.matrix(ae)) as.numeric(ae[, 1]) else as.numeric(t$age)
+      v <- t$paleoData_values
+      val_rep <- if (is.matrix(v) && NCOL(v) > 1) apply(v, 1, median, na.rm = TRUE) else as.numeric(v)
+      unc <- as.numeric(t$paleoData_uncertainty1sd %||% 1.5)
+      if (length(age_rep) != length(val_rep)) return(rep(NA_real_, length(binAges)))
+      if (is_first) {
+        this_age <- age_rep
+        this_val <- val_rep
+      } else {
+        this_age <- age_rep * rnorm(1, mean = 1, sd = 0.05)
+        this_val <- val_rep + rnorm(length(val_rep), mean = 0, sd = unc)
+      }
+      ok <- is.finite(this_age) & is.finite(this_val) &
+            this_age >= binvec[1] & this_age <= binvec[nb_edges]
+      out <- rep(NA_real_, length(binAges))
+      if (sum(ok) >= 3) {
+        bi <- findInterval(this_age[ok], binvec, all.inside = TRUE)
+        vok <- this_val[ok]
+        # mean per bin
+        s <- tapply(vok, bi, mean, na.rm = TRUE)
+        out[as.integer(names(s))] <- as.numeric(s)
+      }
+      # PER-RECORD anomaly relative to 3-5 ka (SCC_GMST_122719.m line 142, 167:
+      # `binMid > normStart & binMid < normEnd` -- STRICT inequality on both ends,
+      # so bin centers at 3000 and 5000 are EXCLUDED). MATLAB's nanmean keeps
+      # records with >=1 finite ref bin (returns NaN only when all NaN).
+      ref_vals <- out[binAges > 3000 & binAges < 5000]
+      ref_vals <- ref_vals[is.finite(ref_vals)]
+      if (length(ref_vals) >= 1) out - mean(ref_vals) else rep(NA_real_, length(binAges))
+    }, numeric(length(binAges)))
+    if (is.null(dim(bm))) bm <- matrix(bm, ncol = length(fi))
+    bm[!is.finite(bm)] <- NA
+    cb <- cell[fi]; keep <- which(!is.na(cb) & colSums(is.finite(bm)) > 0)
+    if (length(keep) < 2) next
+    bm <- bm[, keep, drop = FALSE]; cb <- cb[keep]
+    fin <- is.finite(bm); bm0 <- bm; bm0[!fin] <- 0
+    sums <- rowsum(t(bm0), group = cb); cnts <- rowsum(t(fin) * 1.0, group = cb)
+    cellMat <- t(sums / cnts); cellMat[!is.finite(cellMat)] <- NA
+    # SCC's gridMat.m line: `totalMedian = nanmedian(gridMean, 2)` -- cross-cell
+    # MEDIAN, not mean. The per-cell 6 ka anomaly distribution is right-skewed
+    # (high-lat land outliers), so mean overshoots median by exactly the +0.05
+    # magnitude we were seeing -- stable across ensemble members.
+    bandMat[, b] <- apply(cellMat, 1, median, na.rm = TRUE)
+  }
+  bandMat
+}
+
+member_fn <- if (METHOD == "scc") one_member_scc else one_member_compose
+
+cat(sprintf("[repro] running %s with nens=%d on %d cores ...\n", toupper(METHOD), NENS, NCORES))
+t0 <- Sys.time()
+cols <- if (NCORES > 1 && .Platform$OS.type == "unix")
+  parallel::mclapply(seq_len(NENS), member_fn, mc.cores = NCORES, mc.preschedule = TRUE) else
+  lapply(seq_len(NENS), member_fn)
+cat(sprintf("[repro] composited in %.1f min\n", as.numeric(difftime(Sys.time(), t0, units = "mins"))))
+
+nb <- length(binAges)
+cols <- lapply(cols, function(mm) if (is.matrix(mm) && all(dim(mm) == c(nb, N_BANDS))) mm else matrix(NA_real_, nb, N_BANDS))
+
+# Area-weight bands -> global per member. SCC.m and DCC.R both use a plain
+# NaN-propagating sum. Published archives have 0 NaN, meaning per-band
+# composites were fully finite in 2020.
+area_weight <- function(mm) {
+  w <- matrix(ZONAL_W, nrow = nb, ncol = N_BANDS, byrow = TRUE)
+  rowSums(mm * w)
+}
+glob <- vapply(cols, area_weight, numeric(nb))      # nb x nens
+
+# archival reference convention: per-member remove full-12k mean, then set the
+# ensemble median to 0 at 100 BP (NOAA readme).
+glob <- sweep(glob, 2, colMeans(glob, na.rm = TRUE), "-")
+r100 <- which.min(abs(binAges - 100))
+glob <- glob - median(glob[r100, ], na.rm = TRUE)
+
+df <- data.frame(binAges = binAges, glob)
+names(df) <- c("binAges", paste0("ens", seq_len(ncol(glob))))
+outfile <- file.path(OUT, paste0(METHOD, "_global.csv"))
+write.csv(df, outfile, row.names = FALSE)
+cat("[repro] wrote", outfile, "\n")
