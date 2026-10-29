@@ -118,6 +118,10 @@ jobs:
     with:
       reconstruction_id: Reconstruction_Run_${{ needs.find-latest-run.outputs.run_number }}_Reviz_${{ github.run_number }}
       artifact_name:     recon-data-for-viz-${{ github.run_number }}
+      # Name the output for paleopresto.com
+      site_dataset_id: presto_temp12k
+      site_dataset_name: 'presto-Temperature 12k'
+      site_version: '0_1_0'
 
   # ── Path B: 1D / non-spatial output → static-Pages tile UI ──────────
   visualize-static:
